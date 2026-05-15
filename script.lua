@@ -438,4 +438,3 @@ Rayfield:Notify({
     Content = "Attack on Titan Revolution script ready!",
     Duration = 5,
 })
-loadstring(game:HttpGet("https://raw.githubusercontent.com/CLXMPEX/CLXMPEX/main/script.lua", true))()
