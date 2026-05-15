@@ -2,10 +2,10 @@
 local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 
 local Window = Rayfield:CreateWindow({
-    Name = "CLXMPEX | AoT Revolution",
+    Name = "COCK | AoT Revolution",
     LoadingTitle = "CLXMPEX",
     LoadingSubtitle = "Attack on Titan Revolution",
-    Theme = "Custom",
+    Theme = "Bloom",
     CustomTheme = {
         TextColor = Color3.fromRGB(255, 200, 0),
         Background = Color3.fromRGB(10, 10, 10),
