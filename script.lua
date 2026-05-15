@@ -2,43 +2,10 @@
 local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 
 local Window = Rayfield:CreateWindow({
-    Name = "COCK | AoT Revolution",
-    LoadingTitle = "DICKHEAD",
+    Name = "CLXMPEX | AoT Revolution",
+    LoadingTitle = "CLXMPEX",
     LoadingSubtitle = "Attack on Titan Revolution",
     Theme = "Ocean",
-    CustomTheme = {
-        TextColor = Color3.fromRGB(255, 200, 0),
-        Background = Color3.fromRGB(10, 10, 10),
-        Topbar = Color3.fromRGB(20, 20, 20),
-        Shadow = Color3.fromRGB(0, 0, 0),
-        NotificationBackground = Color3.fromRGB(20, 20, 20),
-        NotificationActionsBackground = Color3.fromRGB(30, 30, 30),
-        TabBackground = Color3.fromRGB(15, 15, 15),
-        TabStroke = Color3.fromRGB(255, 180, 0),
-        TabBackgroundSelected = Color3.fromRGB(255, 180, 0),
-        TabTextColor = Color3.fromRGB(180, 140, 0),
-        SelectedTabTextColor = Color3.fromRGB(0, 0, 0),
-        ElementBackground = Color3.fromRGB(20, 20, 20),
-        ElementBackgroundHover = Color3.fromRGB(30, 30, 30),
-        SecondaryElementBackground = Color3.fromRGB(25, 25, 25),
-        ElementStroke = Color3.fromRGB(255, 180, 0),
-        SecondaryElementStroke = Color3.fromRGB(180, 140, 0),
-        SliderBackground = Color3.fromRGB(30, 30, 30),
-        SliderProgress = Color3.fromRGB(255, 180, 0),
-        SliderStroke = Color3.fromRGB(255, 180, 0),
-        ToggleBackground = Color3.fromRGB(30, 30, 30),
-        ToggleEnabled = Color3.fromRGB(255, 180, 0),
-        ToggleDisabled = Color3.fromRGB(50, 50, 50),
-        ToggleEnabledStroke = Color3.fromRGB(255, 200, 0),
-        ToggleDisabledStroke = Color3.fromRGB(40, 40, 40),
-        ToggleEnabledOuterStroke = Color3.fromRGB(200, 150, 0),
-        ToggleDisabledOuterStroke = Color3.fromRGB(30, 30, 30),
-        DropdownSelected = Color3.fromRGB(255, 180, 0),
-        DropdownUnselected = Color3.fromRGB(30, 30, 30),
-        InputBackground = Color3.fromRGB(20, 20, 20),
-        InputStroke = Color3.fromRGB(255, 180, 0),
-        PlaceholderColor = Color3.fromRGB(180, 140, 0),
-    },
     DisableRayfieldPrompts = false,
     DisableBuildWarnings = false,
 })
@@ -47,6 +14,7 @@ local Window = Rayfield:CreateWindow({
 -- CONFIG
 -- =====================
 local Config = {
+    KillMethod = "Teleport To Titan",
     AutoFarmSpeed = 300,
     FloatHeight = 400,
     HitXTitans = 3,
@@ -286,11 +254,13 @@ MainTab:CreateSlider({
     Callback = function(val) Config.FloatHeight = val end,
 })
 
-MainTab:CreateToggle({
-    Name = "Teleport To Titans",
-    CurrentValue = true,
-    Flag = "TeleportToTitans",
-    Callback = function(val) Config.TeleportToTitans = val end,
+MainTab:CreateDropdown({
+    Name = "Kill Method",
+    Options = {"Teleport To Titan", "Hover Over Titan"},
+    CurrentOption = {"Teleport To Titan"},
+    Flag = "KillMethod",
+    MultipleOptions = false,
+    Callback = function(val) Config.KillMethod = val end,
 })
 
 MainTab:CreateSection("Security")
