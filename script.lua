@@ -27,12 +27,7 @@ local count = 0
 local paused = false
 
 -- noisy remotes to skip so the log stays readable (edit as needed)
-local SKIP = {
-    ["weapons.activate"] = true,
-    ["stream.retrieve"] = true,
-    ["automation.syncNotifications"] = true,
-    ["syncNotification"] = true,
-}
+local SKIP = {}  -- nothing skipped: capture EVERYTHING
 
 local logLabel
 local function refresh() if logLabel then logLabel.Text = table.concat(lines, "\n") end end
@@ -330,5 +325,5 @@ end)
 push("hook mode: " .. (hookedOk and "namecall (best)" or "per-remote fallback"))
 push("Play the game — remote calls will appear here.")
 push("Tap DUMP to list every remote. Tap COPY to copy all.")
-push("Noisy remotes are skipped; edit SKIP{} to change.")
+push("Nothing skipped — every remote is captured.")
 push("=================================================")
