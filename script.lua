@@ -1,18 +1,17 @@
 -- ============================================================
---  REMOTE SPY  (comprehensive, standalone)
---  Captures everything about the game's remotes:
---   * Hooks EVERY FireServer / InvokeServer / FireAllClients etc.
---     and logs the remote's full path, the method, and the args.
---   * Can DUMP the full list of remotes in the game on demand.
---   * Live counter + on-screen log + COPY button (mobile-friendly).
+--  GAME EXPLORER  (passive — NO hooks, cannot block input)
 --
---  HOW TO USE:
---   1) Run it. A panel appears with a live log.
---   2) Play normally — every remote the game fires shows up.
---   3) Tap DUMP to list every remote object in the game.
---   4) Tap COPY to copy the whole log; paste it to me.
+--  The remote spy blocked your screen because hooking __namecall
+--  intercepts EVERY tap on this game. This version hooks NOTHING.
+--  It only READS the game and dumps what it finds. Your screen and
+--  buying/selling work completely normally the whole time.
 --
---  Buttons: DUMP (list all remotes) · PAUSE · CLEAR · COPY · X
+--  Tap a category button to scan it; read the results; COPY to send.
+--   REMOTES  — every RemoteEvent/Function + path
+--   MODULES  — ModuleScripts likely holding shop/seed/fruit data
+--   SHOP     — anything named shop/buy/seed/purchase
+--   FRUIT    — anything named fruit/sell/harvest/crop
+--   DATA     — your player data (leaderstats, attributes, folders)
 -- ============================================================
 
 local Players = game:GetService("Players")
@@ -20,361 +19,279 @@ local RS      = game:GetService("ReplicatedStorage")
 local player  = Players.LocalPlayer
 local pgui    = player:WaitForChild("PlayerGui", 10)
 
--- ---------- log store ----------
-local lines = {}          -- newest first
-local maxLines = 400
-local count = 0
-local paused = false
-
--- noisy remotes to skip so the log stays readable (edit as needed)
-local SKIP = {}  -- nothing skipped: capture EVERYTHING
-
-local logLabel
-local function refresh() if logLabel then logLabel.Text = table.concat(lines, "\n") end end
-local function push(s)
-    table.insert(lines, 1, s)
-    while #lines > maxLines do table.remove(lines) end
-    refresh()
+-- ---------- log ----------
+local lines = {}
+local function refresh() end  -- set after label made
+local out
+local function log(s)
+    table.insert(lines, s)
+    if #lines > 800 then table.remove(lines, 1) end
+    if out then out.Text = table.concat(lines, "\n") end
 end
+local function clear() lines = {}; if out then out.Text = "" end end
 
--- ---------- value stringify ----------
+-- ---------- value stringify (read-only, safe) ----------
 local function short(v, depth)
     depth = depth or 0
     local t = typeof(v)
-    if t == "string" then
-        if #v > 60 then v = v:sub(1, 60) .. "~" end
-        return '"' .. v .. '"'
-    elseif t == "number" or t == "boolean" then
-        return tostring(v)
-    elseif t == "nil" then
-        return "nil"
-    elseif t == "Instance" then
-        return "<" .. v.ClassName .. ":" .. v.Name .. ">"
-    elseif t == "Vector3" then
-        return string.format("V3(%.1f,%.1f,%.1f)", v.X, v.Y, v.Z)
-    elseif t == "CFrame" then
-        local p = v.Position
-        return string.format("CF(%.1f,%.1f,%.1f)", p.X, p.Y, p.Z)
-    elseif t == "table" then
+    if t == "string" then return (#v > 50 and (v:sub(1,50).."~") or v) end
+    if t == "number" or t == "boolean" then return tostring(v) end
+    if t == "Instance" then return "<"..v.ClassName..">" end
+    if t == "Vector3" then return string.format("V3(%.0f,%.0f,%.0f)",v.X,v.Y,v.Z) end
+    if t == "table" then
         if depth > 2 then return "{...}" end
-        local parts, n = {}, 0
+        local p, n = {}, 0
         for k, vv in pairs(v) do
             n = n + 1
-            if n > 12 then table.insert(parts, "..."); break end
-            table.insert(parts, tostring(k) .. "=" .. short(vv, depth + 1))
+            if n > 20 then table.insert(p, "..."); break end
+            table.insert(p, tostring(k).."="..short(vv, depth+1))
         end
-        return "{" .. table.concat(parts, ", ") .. "}"
+        return "{"..table.concat(p, ", ").."}"
     end
     return t
 end
 
-local function argsToStr(args, n)
-    local parts = {}
-    for i = 1, n do
-        parts[i] = short(args[i])
+-- ---------- scans ----------
+local function scanRemotes()
+    clear()
+    log("===== REMOTES =====")
+    local found = {}
+    for _, d in ipairs(RS:GetDescendants()) do
+        if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") or d:IsA("UnreliableRemoteEvent") then
+            local cls = d:IsA("RemoteFunction") and "RF" or "RE"
+            local path = d.Name
+            pcall(function() path = d:GetFullName() end)
+            table.insert(found, cls.."  "..path)
+        end
     end
-    return table.concat(parts, ", ")
+    table.sort(found)
+    for _, s in ipairs(found) do log(s) end
+    log("total: "..#found)
 end
 
--- ---------- the remote hook (namecall) ----------
--- Captures FireServer / InvokeServer from RemoteEvent / RemoteFunction /
--- UnreliableRemoteEvent. Uses hookmetamethod if available, else falls back
--- to hooking each remote's methods individually.
-local hookedOk = false
-local unhook = nil   -- called on close to fully restore the game
-
-pcall(function()
-    -- Preferred: hookmetamethod (clean, restorable, doesn't leave the
-    -- metatable writable). This is the safest way and won't block input.
-    if hookmetamethod and newcclosure then
-        local original
-        original = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-            -- Do the LEAST possible work here so taps/input never lag.
-            local method = getnamecallmethod and getnamecallmethod() or ""
-            if not paused and (method == "FireServer" or method == "InvokeServer") then
-                if typeof(self) == "Instance"
-                   and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")
-                        or self:IsA("UnreliableRemoteEvent")) then
-                    local nm = self.Name
-                    if not SKIP[nm] then
-                        -- capture into log OUTSIDE the hot path where possible
-                        local n = select("#", ...)
-                        local args = { ... }
-                        count = count + 1
-                        task.spawn(function()
-                            local path = nm
-                            pcall(function() path = self:GetFullName() end)
-                            push("[" .. count .. "] " .. method .. "  " .. nm)
-                            push("     path: " .. path)
-                            push("     args(" .. n .. "): " .. (n > 0 and argsToStr(args, n) or "(none)"))
-                        end)
-                    end
+local function scanModules(filterWords)
+    clear()
+    log("===== MODULES"..(filterWords and " (filtered)" or "").." =====")
+    local n = 0
+    for _, d in ipairs(RS:GetDescendants()) do
+        if d:IsA("ModuleScript") then
+            local nm = string.lower(d.Name)
+            local match = not filterWords
+            if filterWords then
+                for _, w in ipairs(filterWords) do
+                    if string.find(nm, w, 1, true) then match = true; break end
                 end
             end
-            return original(self, ...)
-        end))
-        unhook = function()
-            -- restore by hooking back to the original
-            pcall(function() hookmetamethod(game, "__namecall", original) end)
+            if match then
+                n = n + 1
+                if n <= 120 then
+                    local path = d.Name
+                    pcall(function() path = d:GetFullName() end)
+                    log(d.Name.."   ["..path.."]")
+                end
+            end
         end
-        hookedOk = true
     end
-end)
-
--- Manual metatable fallback (only if hookmetamethod isn't available).
-if not hookedOk then
-    pcall(function()
-        local mt = getrawmetatable(game)
-        local old = mt.__namecall
-        setreadonly(mt, false)
-        mt.__namecall = newcclosure(function(self, ...)
-            local method = getnamecallmethod and getnamecallmethod() or ""
-            if not paused and (method == "FireServer" or method == "InvokeServer") then
-                if typeof(self) == "Instance"
-                   and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")
-                        or self:IsA("UnreliableRemoteEvent")) then
-                    local nm = self.Name
-                    if not SKIP[nm] then
-                        local n = select("#", ...)
-                        local args = { ... }
-                        count = count + 1
-                        task.spawn(function()
-                            local path = nm
-                            pcall(function() path = self:GetFullName() end)
-                            push("[" .. count .. "] " .. method .. "  " .. nm)
-                            push("     path: " .. path)
-                            push("     args(" .. n .. "): " .. (n > 0 and argsToStr(args, n) or "(none)"))
-                        end)
-                    end
-                end
-            end
-            return old(self, ...)
-        end)
-        setreadonly(mt, true)
-        unhook = function()
-            pcall(function()
-                setreadonly(mt, false)
-                mt.__namecall = old
-                setreadonly(mt, true)
-            end)
-        end
-        hookedOk = true
-    end)
+    log("total matched: "..n)
 end
 
--- Fallback if hookmetamethod-style approach failed: hook each remote object.
-if not hookedOk then
-    pcall(function()
-        local function hookRemote(rem)
-            if rem:IsA("RemoteEvent") or rem:IsA("UnreliableRemoteEvent") then
-                local orig = rem.FireServer
-                rem.FireServer = function(self, ...)
-                    if not paused and not SKIP[self.Name] then
-                        local n = select("#", ...)
-                        count = count + 1
-                        push("[" .. count .. "] FireServer  " .. self.Name)
-                        push("     args(" .. n .. "): " .. argsToStr({...}, n))
-                    end
-                    return orig(self, ...)
-                end
-            elseif rem:IsA("RemoteFunction") then
-                local orig = rem.InvokeServer
-                rem.InvokeServer = function(self, ...)
-                    if not paused and not SKIP[self.Name] then
-                        local n = select("#", ...)
-                        count = count + 1
-                        push("[" .. count .. "] InvokeServer  " .. self.Name)
-                        push("     args(" .. n .. "): " .. argsToStr({...}, n))
-                    end
-                    return orig(self, ...)
-                end
-            end
-        end
-        for _, d in ipairs(game:GetDescendants()) do
-            if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") or d:IsA("UnreliableRemoteEvent") then
-                pcall(hookRemote, d)
-            end
-        end
-    end)
-end
-
--- ---------- DUMP: list every remote in the game ----------
-local function dumpRemotes()
-    push("================ REMOTE DUMP ================")
-    local roots = { ReplicatedStorage = RS,
-                    ReplicatedFirst = game:GetService("ReplicatedFirst") }
-    -- also scan workspace + a couple common spots lightly
+-- generic name search across RS + workspace for buy/sell/seed/fruit
+local function scanByWords(title, words)
+    clear()
+    log("===== "..title.." =====")
+    local roots = { RS, workspace, player }
+    local n = 0
     local seen = {}
-    local total = 0
-    for rootName, root in pairs(roots) do
-        local found = {}
+    for _, root in ipairs(roots) do
         for _, d in ipairs(root:GetDescendants()) do
-            if (d:IsA("RemoteEvent") or d:IsA("RemoteFunction") or d:IsA("UnreliableRemoteEvent"))
-               and not seen[d] then
-                seen[d] = true
-                total = total + 1
-                local cls = d:IsA("RemoteFunction") and "RF" or "RE"
-                table.insert(found, cls .. "  " .. d.Name)
+            if seen[d] then continue end
+            local nm = string.lower(d.Name)
+            for _, w in ipairs(words) do
+                if string.find(nm, w, 1, true) then
+                    seen[d] = true
+                    n = n + 1
+                    if n <= 150 then
+                        local path = d.Name
+                        pcall(function() path = d:GetFullName() end)
+                        log(d.ClassName.."  "..path)
+                    end
+                    break
+                end
             end
         end
-        push("-- " .. rootName .. " (" .. #found .. ") --")
-        table.sort(found)
-        for _, s in ipairs(found) do push("   " .. s) end
     end
-    push("TOTAL remotes: " .. total)
-    push("================ END DUMP ================")
+    log("total: "..n)
 end
 
--- ---------- GUI ----------
+local function scanData()
+    clear()
+    log("===== PLAYER DATA =====")
+    -- leaderstats
+    local ls = player:FindFirstChild("leaderstats")
+    if ls then
+        log("-- leaderstats --")
+        for _, v in ipairs(ls:GetChildren()) do
+            log("  "..v.Name.." = "..short(v.Value ~= nil and v.Value or "?"))
+        end
+    else
+        log("no leaderstats")
+    end
+    -- attributes on player
+    log("-- player attributes --")
+    for k, v in pairs(player:GetAttributes()) do
+        log("  "..k.." = "..short(v))
+    end
+    -- child folders of player (data holders)
+    log("-- player child folders --")
+    for _, c in ipairs(player:GetChildren()) do
+        if c:IsA("Folder") or c:IsA("Configuration") then
+            log("  "..c.Name.." ("..#c:GetChildren().." kids)")
+        end
+    end
+    -- common data folders in RS
+    log("-- RS data-ish folders --")
+    for _, d in ipairs(RS:GetChildren()) do
+        local nm = string.lower(d.Name)
+        if string.find(nm,"data",1,true) or string.find(nm,"config",1,true)
+           or string.find(nm,"item",1,true) or string.find(nm,"shop",1,true) then
+            log("  "..d.Name.." ("..d.ClassName..")")
+        end
+    end
+end
+
+-- ---------- GUI (plain frame, NO hooks anywhere) ----------
 local sg = Instance.new("ScreenGui")
-sg.Name = "RemoteSpy"
+sg.Name = "GameExplorer"
 sg.ResetOnSpawn = false
 sg.DisplayOrder = 99999
 sg.IgnoreGuiInset = true
 sg.Parent = pgui
 
 local panel = Instance.new("Frame", sg)
-panel.Size = UDim2.new(0, 400, 0, 340)
-panel.Position = UDim2.new(0, 16, 0, 54)
-panel.BackgroundColor3 = Color3.fromRGB(10, 10, 16)
+panel.Size = UDim2.new(0, 400, 0, 360)
+panel.Position = UDim2.new(0, 14, 0, 54)
+panel.BackgroundColor3 = Color3.fromRGB(14, 16, 20)
 panel.BackgroundTransparency = 0.05
 panel.BorderSizePixel = 0
-Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 8)
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 10)
 local strk = Instance.new("UIStroke", panel)
-strk.Color = Color3.fromRGB(255, 120, 200); strk.Thickness = 1
+strk.Color = Color3.fromRGB(90, 200, 130); strk.Thickness = 1
 
--- top bar (drag + title + count)
 local top = Instance.new("Frame", panel)
 top.Size = UDim2.new(1, 0, 0, 30)
-top.BackgroundColor3 = Color3.fromRGB(22, 20, 28)
+top.BackgroundColor3 = Color3.fromRGB(20, 26, 22)
 top.BorderSizePixel = 0
-Instance.new("UICorner", top).CornerRadius = UDim.new(0, 8)
-
+Instance.new("UICorner", top).CornerRadius = UDim.new(0, 10)
 local title = Instance.new("TextLabel", top)
-title.Size = UDim2.new(0.6, 0, 1, 0)
-title.Position = UDim2.new(0, 8, 0, 0)
+title.Size = UDim2.new(0.7, 0, 1, 0)
+title.Position = UDim2.new(0, 10, 0, 0)
 title.BackgroundTransparency = 1
-title.TextColor3 = Color3.fromRGB(255, 150, 210)
+title.TextColor3 = Color3.fromRGB(120, 230, 150)
 title.Font = Enum.Font.GothamBold
 title.TextSize = 12
 title.TextXAlignment = Enum.TextXAlignment.Left
-title.Text = "REMOTE SPY: 0"
+title.Text = "GAME EXPLORER (passive)"
 
--- button row
-local btnRow = Instance.new("Frame", panel)
-btnRow.Size = UDim2.new(1, -8, 0, 28)
-btnRow.Position = UDim2.new(0, 4, 0, 32)
-btnRow.BackgroundTransparency = 1
+-- two rows of category buttons
+local row1 = Instance.new("Frame", panel)
+row1.Size = UDim2.new(1, -8, 0, 26)
+row1.Position = UDim2.new(0, 4, 0, 32)
+row1.BackgroundTransparency = 1
+local row2 = Instance.new("Frame", panel)
+row2.Size = UDim2.new(1, -8, 0, 26)
+row2.Position = UDim2.new(0, 4, 0, 60)
+row2.BackgroundTransparency = 1
 
-local function mkBtn(txt, color, order, w)
-    local b = Instance.new("TextButton", btnRow)
+local function btn(parent, txt, color, x, w)
+    local b = Instance.new("TextButton", parent)
     b.Size = UDim2.new(0, w, 1, 0)
-    b.Position = UDim2.new(0, order, 0, 0)
+    b.Position = UDim2.new(0, x, 0, 0)
     b.BackgroundColor3 = color
     b.Text = txt
-    b.TextColor3 = Color3.new(1, 1, 1)
+    b.TextColor3 = Color3.new(1,1,1)
     b.Font = Enum.Font.GothamBold
-    b.TextSize = 11
+    b.TextSize = 10
     b.BorderSizePixel = 0
     Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
     return b
 end
 
-local dumpBtn  = mkBtn("DUMP",  Color3.fromRGB(150, 90, 220), 0,   72)
-local pauseBtn = mkBtn("PAUSE", Color3.fromRGB(200, 150, 40), 76,  72)
-local clearBtn = mkBtn("CLEAR", Color3.fromRGB(90, 90, 110),  152, 62)
-local copyBtn  = mkBtn("COPY",  Color3.fromRGB(70, 130, 210), 218, 72)
-local closeBtn = mkBtn("X",     Color3.fromRGB(200, 55, 55),  294, 40)
+local bRemotes = btn(row1, "REMOTES", Color3.fromRGB(90,150,220), 0,   84)
+local bModules = btn(row1, "MODULES", Color3.fromRGB(150,110,220), 88,  84)
+local bShop    = btn(row1, "SHOP",    Color3.fromRGB(210,150,40),  176, 66)
+local bFruit   = btn(row1, "FRUIT",   Color3.fromRGB(210,90,120),  246, 66)
+local bData    = btn(row1, "DATA",    Color3.fromRGB(60,180,120),  316, 70)
 
--- log scroll
+local bCopy    = btn(row2, "COPY",    Color3.fromRGB(70,130,210),  0,   120)
+local bClear   = btn(row2, "CLEAR",   Color3.fromRGB(90,90,110),   124, 100)
+local bClose   = btn(row2, "CLOSE",   Color3.fromRGB(200,55,55),   228, 158)
+
+-- output scroll
 local scroll = Instance.new("ScrollingFrame", panel)
-scroll.Size = UDim2.new(1, -8, 1, -66)
-scroll.Position = UDim2.new(0, 4, 0, 62)
-scroll.BackgroundColor3 = Color3.fromRGB(6, 6, 10)
+scroll.Size = UDim2.new(1, -8, 1, -94)
+scroll.Position = UDim2.new(0, 4, 0, 90)
+scroll.BackgroundColor3 = Color3.fromRGB(8, 10, 12)
 scroll.BorderSizePixel = 0
 scroll.ScrollBarThickness = 5
-scroll.ScrollBarImageColor3 = Color3.fromRGB(255, 120, 200)
+scroll.ScrollBarImageColor3 = Color3.fromRGB(90, 200, 130)
 scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
 scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
 Instance.new("UICorner", scroll).CornerRadius = UDim.new(0, 6)
 
-logLabel = Instance.new("TextLabel", scroll)
-logLabel.Size = UDim2.new(1, -8, 0, 0)
-logLabel.Position = UDim2.new(0, 4, 0, 2)
-logLabel.AutomaticSize = Enum.AutomaticSize.Y
-logLabel.BackgroundTransparency = 1
-logLabel.TextColor3 = Color3.fromRGB(220, 225, 235)
-logLabel.Font = Enum.Font.Code
-logLabel.TextSize = 10
-logLabel.TextXAlignment = Enum.TextXAlignment.Left
-logLabel.TextYAlignment = Enum.TextYAlignment.Top
-logLabel.TextWrapped = true
-logLabel.Text = ""
+out = Instance.new("TextLabel", scroll)
+out.Size = UDim2.new(1, -8, 0, 0)
+out.Position = UDim2.new(0, 4, 0, 2)
+out.AutomaticSize = Enum.AutomaticSize.Y
+out.BackgroundTransparency = 1
+out.TextColor3 = Color3.fromRGB(210, 230, 215)
+out.Font = Enum.Font.Code
+out.TextSize = 10
+out.TextXAlignment = Enum.TextXAlignment.Left
+out.TextYAlignment = Enum.TextYAlignment.Top
+out.TextWrapped = true
+out.Text = ""
 
--- button actions
-dumpBtn.MouseButton1Click:Connect(function()
-    dumpBtn.Text = "..."
-    task.spawn(function()
-        dumpRemotes()
-        dumpBtn.Text = "DUMP"
-    end)
-end)
-pauseBtn.MouseButton1Click:Connect(function()
-    paused = not paused
-    pauseBtn.Text = paused and "RESUME" or "PAUSE"
-    pauseBtn.BackgroundColor3 = paused and Color3.fromRGB(60, 160, 90) or Color3.fromRGB(200, 150, 40)
-end)
-clearBtn.MouseButton1Click:Connect(function()
-    lines = {}; refresh()
-end)
-copyBtn.MouseButton1Click:Connect(function()
-    local ordered = {}
-    for i = #lines, 1, -1 do table.insert(ordered, lines[i]) end
-    local out = "=== REMOTE SPY OUTPUT ===\nhook mode: "
-        .. (hookedOk and "namecall" or "per-remote")
-        .. "\n" .. table.concat(ordered, "\n")
+-- wire buttons (each runs a passive scan in a separate thread)
+local function run(fn) task.spawn(function() pcall(fn) end) end
+bRemotes.MouseButton1Click:Connect(function() run(scanRemotes) end)
+bModules.MouseButton1Click:Connect(function() run(function() scanModules() end) end)
+bShop.MouseButton1Click:Connect(function() run(function()
+    scanByWords("SHOP / BUY / SEED", {"shop","buy","seed","purchase","store","gourmet"})
+end) end)
+bFruit.MouseButton1Click:Connect(function() run(function()
+    scanByWords("FRUIT / SELL / CROP", {"fruit","sell","harvest","crop","plant","produce"})
+end) end)
+bData.MouseButton1Click:Connect(function() run(scanData) end)
+bClear.MouseButton1Click:Connect(clear)
+bCopy.MouseButton1Click:Connect(function()
+    local text = table.concat(lines, "\n")
     local clip = setclipboard or toclipboard or set_clipboard or (syn and syn.write_clipboard)
-    local ok = clip and pcall(function() clip(out) end)
-    copyBtn.Text = ok and "COPIED!" or "NO CLIP"
-    task.wait(1.2); copyBtn.Text = "COPY"
+    local ok = clip and pcall(function() clip(text) end)
+    bCopy.Text = ok and "COPIED!" or "NO CLIP"
+    task.wait(1.2); bCopy.Text = "COPY"
 end)
-closeBtn.MouseButton1Click:Connect(function()
-    -- restore the game's original __namecall so taps/input work normally again
-    if unhook then pcall(unhook) end
-    sg:Destroy()
-end)
+bClose.MouseButton1Click:Connect(function() sg:Destroy() end)
 
--- drag by top bar
+-- drag by top bar (only affects THIS window; touches nothing else)
 local UIS = game:GetService("UserInputService")
-local drag = { on = false, s = nil, p = nil }
+local drag = { on=false }
 top.InputBegan:Connect(function(i)
-    if i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1 then
-        drag.on = true; drag.s = i.Position; drag.p = panel.Position
+    if i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseButton1 then
+        drag.on=true; drag.s=i.Position; drag.p=panel.Position
     end
 end)
 UIS.InputChanged:Connect(function(i)
-    if drag.on and (i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseMovement) then
-        local d = i.Position - drag.s
-        panel.Position = UDim2.new(drag.p.X.Scale, drag.p.X.Offset + d.X, drag.p.Y.Scale, drag.p.Y.Offset + d.Y)
+    if drag.on and (i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseMovement) then
+        local d=i.Position-drag.s
+        panel.Position=UDim2.new(drag.p.X.Scale,drag.p.X.Offset+d.X,drag.p.Y.Scale,drag.p.Y.Offset+d.Y)
     end
 end)
 UIS.InputEnded:Connect(function(i)
-    if i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1 then
-        drag.on = false
+    if i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseButton1 then
+        drag.on=false
     end
 end)
 
--- live counter
-task.spawn(function()
-    while sg.Parent do
-        title.Text = "REMOTE SPY: " .. count .. (paused and "  [PAUSED]" or "")
-        task.wait(0.3)
-    end
-end)
-
--- startup notes
-push("hook mode: " .. (hookedOk and "namecall (best)" or "per-remote fallback"))
-push("Play the game — remote calls will appear here.")
-push("Tap DUMP to list every remote. Tap COPY to copy all.")
-push("Nothing skipped — every remote is captured.")
-push("=================================================")
+log("Passive explorer ready. No hooks — your screen works normally.")
+log("Tap a category button above to scan, then COPY.")
+log("Try SHOP and FRUIT first for buy/sell data.")
