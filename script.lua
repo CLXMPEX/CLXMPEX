@@ -81,39 +81,86 @@ end
 -- UnreliableRemoteEvent. Uses hookmetamethod if available, else falls back
 -- to hooking each remote's methods individually.
 local hookedOk = false
+local unhook = nil   -- called on close to fully restore the game
+
 pcall(function()
-    local mt = getrawmetatable(game)
-    local old = mt.__namecall
-    setreadonly(mt, false)
-    mt.__namecall = newcclosure(function(self, ...)
-        local method = getnamecallmethod and getnamecallmethod() or ""
-        if not paused and (method == "FireServer" or method == "InvokeServer"
-            or method == "fireServer" or method == "invokeServer") then
-            if typeof(self) == "Instance"
-               and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")
-                    or self:IsA("UnreliableRemoteEvent")) then
-                local path = self.Name
-                pcall(function() path = self:GetFullName() end)
-                local nameKey = self.Name
-                if not SKIP[nameKey] then
-                    local args = { ... }
-                    local n = select("#", ...)
-                    count = count + 1
-                    push("[" .. count .. "] " .. method .. "  " .. self.Name)
-                    push("     path: " .. path)
-                    if n > 0 then
-                        push("     args(" .. n .. "): " .. argsToStr(args, n))
-                    else
-                        push("     args: (none)")
+    -- Preferred: hookmetamethod (clean, restorable, doesn't leave the
+    -- metatable writable). This is the safest way and won't block input.
+    if hookmetamethod and newcclosure then
+        local original
+        original = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+            -- Do the LEAST possible work here so taps/input never lag.
+            local method = getnamecallmethod and getnamecallmethod() or ""
+            if not paused and (method == "FireServer" or method == "InvokeServer") then
+                if typeof(self) == "Instance"
+                   and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")
+                        or self:IsA("UnreliableRemoteEvent")) then
+                    local nm = self.Name
+                    if not SKIP[nm] then
+                        -- capture into log OUTSIDE the hot path where possible
+                        local n = select("#", ...)
+                        local args = { ... }
+                        count = count + 1
+                        task.spawn(function()
+                            local path = nm
+                            pcall(function() path = self:GetFullName() end)
+                            push("[" .. count .. "] " .. method .. "  " .. nm)
+                            push("     path: " .. path)
+                            push("     args(" .. n .. "): " .. (n > 0 and argsToStr(args, n) or "(none)"))
+                        end)
                     end
                 end
             end
+            return original(self, ...)
+        end))
+        unhook = function()
+            -- restore by hooking back to the original
+            pcall(function() hookmetamethod(game, "__namecall", original) end)
         end
-        return old(self, ...)
-    end)
-    setreadonly(mt, true)
-    hookedOk = true
+        hookedOk = true
+    end
 end)
+
+-- Manual metatable fallback (only if hookmetamethod isn't available).
+if not hookedOk then
+    pcall(function()
+        local mt = getrawmetatable(game)
+        local old = mt.__namecall
+        setreadonly(mt, false)
+        mt.__namecall = newcclosure(function(self, ...)
+            local method = getnamecallmethod and getnamecallmethod() or ""
+            if not paused and (method == "FireServer" or method == "InvokeServer") then
+                if typeof(self) == "Instance"
+                   and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")
+                        or self:IsA("UnreliableRemoteEvent")) then
+                    local nm = self.Name
+                    if not SKIP[nm] then
+                        local n = select("#", ...)
+                        local args = { ... }
+                        count = count + 1
+                        task.spawn(function()
+                            local path = nm
+                            pcall(function() path = self:GetFullName() end)
+                            push("[" .. count .. "] " .. method .. "  " .. nm)
+                            push("     path: " .. path)
+                            push("     args(" .. n .. "): " .. (n > 0 and argsToStr(args, n) or "(none)"))
+                        end)
+                    end
+                end
+            end
+            return old(self, ...)
+        end)
+        setreadonly(mt, true)
+        unhook = function()
+            pcall(function()
+                setreadonly(mt, false)
+                mt.__namecall = old
+                setreadonly(mt, true)
+            end)
+        end
+        hookedOk = true
+    end)
+end
 
 -- Fallback if hookmetamethod-style approach failed: hook each remote object.
 if not hookedOk then
@@ -291,7 +338,11 @@ copyBtn.MouseButton1Click:Connect(function()
     copyBtn.Text = ok and "COPIED!" or "NO CLIP"
     task.wait(1.2); copyBtn.Text = "COPY"
 end)
-closeBtn.MouseButton1Click:Connect(function() sg:Destroy() end)
+closeBtn.MouseButton1Click:Connect(function()
+    -- restore the game's original __namecall so taps/input work normally again
+    if unhook then pcall(unhook) end
+    sg:Destroy()
+end)
 
 -- drag by top bar
 local UIS = game:GetService("UserInputService")
