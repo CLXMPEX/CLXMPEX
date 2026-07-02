@@ -1,14 +1,18 @@
 -- ============================================================
---  SEED / FRUIT FINDER  (v2 — totally passive, input-safe)
+--  BUY PROBE  (input-safe: no hooks, no metatable, no input conns)
 --
---  IMPORTANT: this script does NOT hook anything, does NOT touch
---  the metatable, and does NOT use any UserInputService/InputBegan
---  connections. Those are what were hijacking your taps and chat.
---  This only READS the game and shows results. Nothing you touch
---  is affected — chat, tapping, buying all work normally.
+--  Goal: try to buy a seed WITHOUT opening the shop, by finding a
+--  readable/callable buy path in the game's own code — not by
+--  guessing encoded packets.
 --
---  It runs ONE automatic scan on launch and shows the results.
---  Buttons: SCAN AGAIN · COPY · CLOSE  (plain buttons, no drag).
+--  It looks for:
+--    1) named "buy" RemoteEvents/Functions with readable args
+--    2) ModuleScripts exposing a buy/purchase function we can call
+--    3) client controllers with a Buy method
+--  Then it TRIES buying "Carrot" (1 coin, cheap) and reports what
+--  happened. Read the log; COPY/screenshot; send to Claude.
+--
+--  Nothing here touches your taps, chat, or screen input.
 -- ============================================================
 
 local Players = game:GetService("Players")
@@ -16,218 +20,191 @@ local RS      = game:GetService("ReplicatedStorage")
 local player  = Players.LocalPlayer
 local pgui    = player:WaitForChild("PlayerGui", 10)
 
--- ---------- output store ----------
+local TEST_SEED = "Carrot"   -- cheap test purchase
+
 local lines = {}
 local outLabel
 local function render() if outLabel then outLabel.Text = table.concat(lines, "\n") end end
 local function log(s) lines[#lines+1] = s; render() end
 local function clear() lines = {}; render() end
 
--- ---------- readable value ----------
-local function short(v, d)
-    d = d or 0
-    local t = typeof(v)
-    if t == "string" then return (#v > 48 and v:sub(1,48).."~" or v) end
-    if t == "number" or t == "boolean" then return tostring(v) end
-    if t == "table" then
-        if d > 2 then return "{...}" end
-        local p, n = {}, 0
-        for k, vv in pairs(v) do
-            n = n + 1
-            if n > 25 then p[#p+1] = "..."; break end
-            p[#p+1] = tostring(k).."="..short(vv, d+1)
-        end
-        return "{"..table.concat(p, ", ").."}"
-    end
-    return t
+local function pathOf(o)
+    local p = o.Name
+    pcall(function() p = o:GetFullName() end)
+    return (p:gsub("^Players%..-%.PlayerGui%.", "PlayerGui."))
 end
 
--- try to require a module safely and dump its top-level keys
-local function dumpModule(mod)
-    local ok, data = pcall(require, mod)
-    if not ok or typeof(data) ~= "table" then return false end
-    local path = mod.Name
-    pcall(function() path = mod:GetFullName() end)
-    log("")
-    log(">> MODULE: "..mod.Name)
-    log("   "..path)
-    local n = 0
-    for k, v in pairs(data) do
-        n = n + 1
-        if n > 40 then log("   ...more"); break end
-        log("   "..tostring(k).." = "..short(v))
-    end
-    return true
-end
-
--- ---------- the scan ----------
-local function scan()
-    clear()
-    log("===== SEED / FRUIT FINDER =====")
-    log("(passive read — nothing you tap is affected)")
-
-    -- 1) ModuleScripts whose name hints at shop / seed / fruit data
-    log("")
-    log("== data modules (shop/seed/fruit/item) ==")
-    local dataWords = {"seed","fruit","shop","crop","plant","item","produce","harvest","gourmet","store"}
-    local dumped = 0
-    for _, d in ipairs(RS:GetDescendants()) do
-        if d:IsA("ModuleScript") then
-            local nm = string.lower(d.Name)
-            for _, w in ipairs(dataWords) do
-                if string.find(nm, w, 1, true) then
-                    if dumped < 8 then
-                        if dumpModule(d) then dumped = dumped + 1 end
-                    end
-                    break
-                end
-            end
-        end
-    end
-    if dumped == 0 then log("  (no readable data modules matched)") end
-
-    -- 2) Remotes (names only — for reference)
-    log("")
-    log("== remotes ==")
-    local rem = {}
-    for _, d in ipairs(RS:GetDescendants()) do
-        if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") or d:IsA("UnreliableRemoteEvent") then
-            local path = d.Name
-            pcall(function() path = d:GetFullName() end)
-            rem[#rem+1] = (d:IsA("RemoteFunction") and "RF " or "RE ")..path
-        end
-    end
-    table.sort(rem)
-    for i = 1, math.min(#rem, 40) do log("  "..rem[i]) end
-    log("  remotes total: "..#rem)
-
-    -- 3) Objects named like seed/fruit/shop anywhere in RS + workspace
-    log("")
-    log("== named objects (seed/fruit/shop/sell/buy) ==")
-    local words = {"seed","fruit","shop","sell","buy","crop","harvest"}
-    local seen, n = {}, 0
-    for _, root in ipairs({RS, workspace}) do
-        for _, d in ipairs(root:GetDescendants()) do
-            if not seen[d] then
-                local nm = string.lower(d.Name)
-                for _, w in ipairs(words) do
-                    if string.find(nm, w, 1, true) then
-                        seen[d] = true; n = n + 1
-                        if n <= 60 then
-                            local path = d.Name
-                            pcall(function() path = d:GetFullName() end)
-                            log("  "..d.ClassName.."  "..path)
-                        end
-                        break
-                    end
-                end
-            end
-        end
-    end
-    log("  named total: "..n)
-
-    -- 4) player data
-    log("")
-    log("== player data ==")
+-- get player's coin count if we can find it (to detect a successful buy)
+local function getCoins()
     local ls = player:FindFirstChild("leaderstats")
     if ls then
         for _, v in ipairs(ls:GetChildren()) do
-            log("  "..v.Name.." = "..short(v.Value ~= nil and v.Value or "?"))
+            local nm = string.lower(v.Name)
+            if string.find(nm,"coin",1,true) or string.find(nm,"cash",1,true)
+               or string.find(nm,"money",1,true) or nm == "¢" then
+                local ok, val = pcall(function() return v.Value end)
+                if ok then return v.Name, val end
+            end
         end
-    else
-        log("  no leaderstats")
     end
-    for k, v in pairs(player:GetAttributes()) do
-        log("  attr "..k.." = "..short(v))
+    -- attribute fallback
+    for k, val in pairs(player:GetAttributes()) do
+        local nm = string.lower(k)
+        if string.find(nm,"coin",1,true) or string.find(nm,"cash",1,true)
+           or string.find(nm,"money",1,true) then
+            return k, val
+        end
     end
-
-    log("")
-    log("===== END. tap COPY, paste to Claude =====")
+    return nil, nil
 end
 
--- ============================================================
---  GUI  (plain fixed panel — NO input connections, NO drag)
--- ============================================================
-local old = pgui:FindFirstChild("SeedFruitFinder")
-if old then old:Destroy() end
+-- ---------- the probe ----------
+local function probe()
+    clear()
+    log("===== BUY PROBE ("..TEST_SEED..") =====")
+    local coinName, before = getCoins()
+    if coinName then log("coins ("..coinName.."): "..tostring(before))
+    else log("coins: (couldn't locate a coin stat)") end
+    log("")
 
+    -- 1) named buy remotes
+    log("== named 'buy' remotes ==")
+    local buyRemotes = {}
+    for _, d in ipairs(RS:GetDescendants()) do
+        if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+            local nm = string.lower(d.Name)
+            if string.find(nm,"buy",1,true) or string.find(nm,"purchase",1,true) then
+                buyRemotes[#buyRemotes+1] = d
+                log("  "..(d:IsA("RemoteFunction") and "RF" or "RE").."  "..pathOf(d))
+            end
+        end
+    end
+    if #buyRemotes == 0 then log("  (none — game likely uses the buffer packet)") end
+
+    -- try each named buy remote with common arg shapes
+    for _, rem in ipairs(buyRemotes) do
+        log("  trying "..rem.Name.."...")
+        local shapes = {
+            function() return TEST_SEED end,
+            function() return TEST_SEED, 1 end,
+            function() return {item=TEST_SEED, amount=1} end,
+            function() return "buy", TEST_SEED end,
+        }
+        for i, mk in ipairs(shapes) do
+            pcall(function()
+                if rem:IsA("RemoteFunction") then rem:InvokeServer(mk())
+                else rem:FireServer(mk()) end
+            end)
+            task.wait(0.4)
+            local _, now = getCoins()
+            if coinName and now and before and now ~= before then
+                log("  >> shape "..i.." CHANGED coins ("..tostring(before).."->"..tostring(now)..") — LIKELY BOUGHT!")
+                return
+            end
+        end
+    end
+
+    -- 2) ModuleScripts exposing a buy function
+    log("")
+    log("== modules with a buy/purchase function ==")
+    local tried = 0
+    for _, d in ipairs(RS:GetDescendants()) do
+        if d:IsA("ModuleScript") then
+            local nm = string.lower(d.Name)
+            if string.find(nm,"shop",1,true) or string.find(nm,"buy",1,true)
+               or string.find(nm,"purchase",1,true) or string.find(nm,"seed",1,true) then
+                local ok, m = pcall(require, d)
+                if ok and typeof(m) == "table" then
+                    for k, v in pairs(m) do
+                        local kl = string.lower(tostring(k))
+                        if typeof(v) == "function" and
+                           (string.find(kl,"buy",1,true) or string.find(kl,"purchase",1,true)) then
+                            log("  found "..d.Name.."."..tostring(k).."()")
+                            tried = tried + 1
+                            -- try calling it a few ways
+                            pcall(function() v(TEST_SEED) end); task.wait(0.3)
+                            pcall(function() v(TEST_SEED, 1) end); task.wait(0.3)
+                            pcall(function() v({item=TEST_SEED}) end); task.wait(0.3)
+                            local _, now = getCoins()
+                            if coinName and now and before and now ~= before then
+                                log("  >> coins CHANGED after "..tostring(k).." — LIKELY BOUGHT!")
+                                return
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if tried == 0 then log("  (no callable buy function found in modules)") end
+
+    -- verdict
+    log("")
+    local _, after = getCoins()
+    if coinName and after and before and after ~= before then
+        log("RESULT: coins changed ("..tostring(before).."->"..tostring(after)..") — something worked!")
+    else
+        log("RESULT: no coin change detected.")
+        log("Shop-closed buying likely needs the encoded packet,")
+        log("which isn't safely reachable on this game.")
+        log("The safe route is tapping the buy button (shop open).")
+    end
+    log("===== END — COPY/screenshot to Claude =====")
+end
+
+-- ---------- GUI (no input conns / hooks / drag) ----------
+local nm = "BuyProbe"
+local old = pgui:FindFirstChild(nm)
+if old then old:Destroy() end
 local sg = Instance.new("ScreenGui")
-sg.Name = "SeedFruitFinder"
-sg.ResetOnSpawn = false
-sg.DisplayOrder = 99999
-sg.IgnoreGuiInset = true
-sg.Parent = pgui
+sg.Name = nm; sg.ResetOnSpawn = false; sg.DisplayOrder = 99999
+sg.IgnoreGuiInset = true; sg.Parent = pgui
 
 local panel = Instance.new("Frame", sg)
-panel.Size = UDim2.new(0, 390, 0, 380)
+panel.Size = UDim2.new(0, 400, 0, 360)
 panel.Position = UDim2.new(0, 12, 0, 60)
 panel.BackgroundColor3 = Color3.fromRGB(16, 18, 22)
 panel.BorderSizePixel = 0
 Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 10)
 local strk = Instance.new("UIStroke", panel)
-strk.Color = Color3.fromRGB(90, 200, 130); strk.Thickness = 1
+strk.Color = Color3.fromRGB(240, 180, 60); strk.Thickness = 1
 
 local title = Instance.new("TextLabel", panel)
-title.Size = UDim2.new(1, -12, 0, 26)
-title.Position = UDim2.new(0, 10, 0, 6)
-title.BackgroundTransparency = 1
-title.TextColor3 = Color3.fromRGB(120, 230, 150)
-title.Font = Enum.Font.GothamBold
-title.TextSize = 13
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.Text = "SEED / FRUIT FINDER  (safe)"
+title.Size = UDim2.new(1, -12, 0, 26); title.Position = UDim2.new(0, 10, 0, 6)
+title.BackgroundTransparency = 1; title.TextColor3 = Color3.fromRGB(245, 200, 80)
+title.Font = Enum.Font.GothamBold; title.TextSize = 13
+title.TextXAlignment = Enum.TextXAlignment.Left; title.Text = "BUY PROBE (safe)"
 
--- buttons
-local function btn(txt, color, x, w, y)
+local function mkBtn(txt, color, x, w)
     local b = Instance.new("TextButton", panel)
-    b.Size = UDim2.new(0, w, 0, 30)
-    b.Position = UDim2.new(0, x, 0, y)
-    b.BackgroundColor3 = color
-    b.Text = txt
-    b.TextColor3 = Color3.new(1, 1, 1)
-    b.Font = Enum.Font.GothamBold
-    b.TextSize = 12
-    b.BorderSizePixel = 0
+    b.Size = UDim2.new(0, w, 0, 30); b.Position = UDim2.new(0, x, 0, 34)
+    b.BackgroundColor3 = color; b.Text = txt; b.TextColor3 = Color3.new(1,1,1)
+    b.Font = Enum.Font.GothamBold; b.TextSize = 12; b.BorderSizePixel = 0
     Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
     return b
 end
+local tryBtn   = mkBtn("TRY BUY", Color3.fromRGB(60, 170, 110), 10,  110)
+local copyBtn  = mkBtn("COPY",    Color3.fromRGB(70, 130, 210), 128, 110)
+local closeBtn = mkBtn("CLOSE",   Color3.fromRGB(200, 55, 55),  246, 120)
 
-local scanBtn  = btn("SCAN AGAIN", Color3.fromRGB(60, 170, 110), 10,  120, 34)
-local copyBtn  = btn("COPY",       Color3.fromRGB(70, 130, 210), 138, 110, 34)
-local closeBtn = btn("CLOSE",      Color3.fromRGB(200, 55, 55),  256, 120, 34)
-
--- output area
 local scroll = Instance.new("ScrollingFrame", panel)
-scroll.Size = UDim2.new(1, -12, 1, -76)
-scroll.Position = UDim2.new(0, 6, 0, 70)
-scroll.BackgroundColor3 = Color3.fromRGB(8, 10, 12)
-scroll.BorderSizePixel = 0
-scroll.ScrollBarThickness = 6
-scroll.ScrollBarImageColor3 = Color3.fromRGB(90, 200, 130)
-scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
-scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+scroll.Size = UDim2.new(1, -12, 1, -76); scroll.Position = UDim2.new(0, 6, 0, 70)
+scroll.BackgroundColor3 = Color3.fromRGB(8, 10, 12); scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 6; scroll.ScrollBarImageColor3 = Color3.fromRGB(240, 180, 60)
+scroll.CanvasSize = UDim2.new(0, 0, 0, 0); scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
 Instance.new("UICorner", scroll).CornerRadius = UDim.new(0, 6)
 
 outLabel = Instance.new("TextLabel", scroll)
-outLabel.Size = UDim2.new(1, -10, 0, 0)
-outLabel.Position = UDim2.new(0, 5, 0, 3)
-outLabel.AutomaticSize = Enum.AutomaticSize.Y
-outLabel.BackgroundTransparency = 1
-outLabel.TextColor3 = Color3.fromRGB(210, 230, 215)
-outLabel.Font = Enum.Font.Code
-outLabel.TextSize = 11
-outLabel.TextXAlignment = Enum.TextXAlignment.Left
-outLabel.TextYAlignment = Enum.TextYAlignment.Top
-outLabel.TextWrapped = true
+outLabel.Size = UDim2.new(1, -10, 0, 0); outLabel.Position = UDim2.new(0, 5, 0, 3)
+outLabel.AutomaticSize = Enum.AutomaticSize.Y; outLabel.BackgroundTransparency = 1
+outLabel.TextColor3 = Color3.fromRGB(225, 230, 215); outLabel.Font = Enum.Font.Code
+outLabel.TextSize = 11; outLabel.TextXAlignment = Enum.TextXAlignment.Left
+outLabel.TextYAlignment = Enum.TextYAlignment.Top; outLabel.TextWrapped = true
 outLabel.Text = ""
 
--- button actions (MouseButton1Click ONLY — no InputBegan/InputChanged anywhere)
-scanBtn.MouseButton1Click:Connect(function()
-    scanBtn.Text = "..."
-    task.spawn(function()
-        pcall(scan)
-        scanBtn.Text = "SCAN AGAIN"
-    end)
+tryBtn.MouseButton1Click:Connect(function()
+    tryBtn.Text = "..."
+    task.spawn(function() pcall(probe); tryBtn.Text = "TRY BUY" end)
 end)
 copyBtn.MouseButton1Click:Connect(function()
     local text = table.concat(lines, "\n")
@@ -238,5 +215,6 @@ copyBtn.MouseButton1Click:Connect(function()
 end)
 closeBtn.MouseButton1Click:Connect(function() sg:Destroy() end)
 
--- run one scan automatically on launch
-task.spawn(function() pcall(scan) end)
+log("Ready. Make sure you have a few coins.")
+log("Tap TRY BUY — it attempts to buy 1 "..TEST_SEED.." without the shop.")
+log("Watch your coin count / inventory. Then COPY the result.")
